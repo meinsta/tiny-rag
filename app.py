@@ -38,10 +38,18 @@ _POINT_ID_NAMESPACE = uuid.UUID("6f1d2c3a-9b0e-4a8e-9f31-1c2b3d4e5f60")
 SUPPORTED_FILE_SUFFIXES = {".pdf", ".txt", ".md", ".markdown"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file; demo guardrail.
 
+# Module-level cache for the sparse embedding model (lazy-loaded on first use).
+_sparse_encoder: Optional[Any] = None
+
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     limit: Optional[int] = Field(default=None, ge=1, le=10)
+    # Optional payload filters — any combination narrows the search scope.
+    filter_category: Optional[str] = None
+    filter_source: Optional[str] = None
+    filter_source_type: Optional[str] = None
+    filter_tags: Optional[List[str]] = None
 
 
 def load_documents(data_file: Path) -> List[Dict[str, Any]]:
@@ -154,6 +162,41 @@ def generate_text(prompt: str, model: str, ollama_url: str) -> str:
         return text.strip()
 
     raise RuntimeError("Ollama generation response did not include a non-empty 'response' field.")
+
+
+def _sparse_available() -> bool:
+    """Return True if fastembed is installed and the sparse encoder can be used."""
+    try:
+        from fastembed import SparseTextEmbedding  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _get_sparse_encoder() -> Any:
+    """Lazy-load and cache the BM42 sparse text encoder."""
+    global _sparse_encoder
+    if _sparse_encoder is None:
+        from fastembed import SparseTextEmbedding
+        _sparse_encoder = SparseTextEmbedding(
+            model_name="Qdrant/bm42-all-minilm-l6-v2-attentions"
+        )
+    return _sparse_encoder
+
+
+def get_sparse_embedding(text: str) -> Optional[models.SparseVector]:
+    """Generate a BM42 sparse vector for *text*, or return None if unavailable."""
+    if not _sparse_available():
+        return None
+    try:
+        encoder = _get_sparse_encoder()
+        result = next(iter(encoder.embed([text])))
+        return models.SparseVector(
+            indices=list(result.indices),
+            values=list(result.values),
+        )
+    except Exception:
+        return None
 
 
 def format_preview(text: str, max_length: int = 120) -> str:
@@ -346,12 +389,17 @@ def ensure_collection(
     """Create the collection if missing; verify vector size if it already exists."""
     if client.collection_exists(collection):
         info = client.get_collection(collection)
-        existing_size: Optional[int] = None
-        try:
-            vectors_cfg = info.config.params.vectors
-            existing_size = getattr(vectors_cfg, "size", None)
-        except AttributeError:
-            existing_size = None
+        vectors_cfg = info.config.params.vectors
+
+        # Detect legacy unnamed-vector schema created by an older version.
+        if not isinstance(vectors_cfg, dict):
+            raise RuntimeError(
+                f"Collection '{collection}' was created with an older unnamed-vector "
+                "schema. Run 'python app.py ingest' to drop and recreate it."
+            )
+
+        dense_cfg = vectors_cfg.get("dense")
+        existing_size = getattr(dense_cfg, "size", None) if dense_cfg else None
         if existing_size is not None and existing_size != vector_size:
             raise RuntimeError(
                 f"Collection '{collection}' was created with vector size "
@@ -361,12 +409,26 @@ def ensure_collection(
             )
         return
 
+    sparse_config = (
+        {"sparse": models.SparseVectorParams()} if _sparse_available() else None
+    )
     client.create_collection(
         collection_name=collection,
-        vectors_config=models.VectorParams(
-            size=vector_size, distance=models.Distance.COSINE
-        ),
+        vectors_config={
+            "dense": models.VectorParams(
+                size=vector_size, distance=models.Distance.COSINE
+            )
+        },
+        sparse_vectors_config=sparse_config,
     )
+
+    # Keyword payload indexes for efficient filtered search.
+    for field in ("category", "source", "source_type", "tags"):
+        client.create_payload_index(
+            collection_name=collection,
+            field_name=field,
+            field_schema="keyword",
+        )
 
 
 def _delete_chunks_by_source(
@@ -443,10 +505,14 @@ def ingest_chunks(
             payload["page_end"] = chunk.page_end
         if extra_payload:
             payload.update(extra_payload)
+        chunk_vectors: Dict[str, Any] = {"dense": vector}
+        sparse_vec = get_sparse_embedding(chunk.text)
+        if sparse_vec is not None:
+            chunk_vectors["sparse"] = sparse_vec
         points.append(
             models.PointStruct(
                 id=_deterministic_point_id(source, chunk.chunk_index),
-                vector=vector,
+                vector=chunk_vectors,
                 payload=payload,
             )
         )
@@ -515,6 +581,41 @@ def ingest_bytes(
     )
 
 
+def build_filter(
+    *,
+    category: Optional[str] = None,
+    source: Optional[str] = None,
+    source_type: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+) -> Optional[models.Filter]:
+    """Build a Qdrant payload filter from optional keyword constraints.
+
+    All provided constraints are combined with AND (must). Tags are each
+    added as a separate must-condition so every supplied tag must be present.
+    """
+    conditions: List[Any] = []
+    if category:
+        conditions.append(
+            models.FieldCondition(key="category", match=models.MatchValue(value=category))
+        )
+    if source:
+        conditions.append(
+            models.FieldCondition(key="source", match=models.MatchValue(value=source))
+        )
+    if source_type:
+        conditions.append(
+            models.FieldCondition(
+                key="source_type", match=models.MatchValue(value=source_type)
+            )
+        )
+    if tags:
+        for tag in tags:
+            conditions.append(
+                models.FieldCondition(key="tags", match=models.MatchValue(value=tag))
+            )
+    return models.Filter(must=conditions) if conditions else None
+
+
 def search_documents(
     query: str,
     *,
@@ -523,16 +624,89 @@ def search_documents(
     collection: str,
     model: str,
     limit: int,
-) -> List[Any]:
+    filter_category: Optional[str] = None,
+    filter_source: Optional[str] = None,
+    filter_source_type: Optional[str] = None,
+    filter_tags: Optional[List[str]] = None,
+) -> Tuple[List[Any], str]:
+    """Return (points, search_mode).
+
+    search_mode is 'hybrid' when dense and sparse vectors are fused via RRF,
+    or 'dense' when only the dense vector is used.
+    """
     client = QdrantClient(url=qdrant_url)
-    query_vector = get_embedding(query, model, ollama_url)
+    dense_vector = get_embedding(query, model, ollama_url)
+    query_filter = build_filter(
+        category=filter_category,
+        source=filter_source,
+        source_type=filter_source_type,
+        tags=filter_tags,
+    )
+
+    # Inspect the collection's vector configuration.
+    has_sparse = False
+    is_legacy = False
+    try:
+        info = client.get_collection(collection)
+        vectors_cfg = info.config.params.vectors
+        is_legacy = not isinstance(vectors_cfg, dict)
+        if not is_legacy:
+            sv = getattr(info.config.params, "sparse_vectors", None)
+            has_sparse = bool(sv and "sparse" in sv)
+    except Exception:
+        pass
+
+    if is_legacy:
+        # Older unnamed-vector schema: fall back to unnamespaced query.
+        response = client.query_points(
+            collection_name=collection,
+            query=dense_vector,
+            limit=limit,
+            with_payload=True,
+            query_filter=query_filter,
+        )
+        return response.points, "dense"
+
+    if has_sparse:
+        sparse_vec = get_sparse_embedding(query)
+    else:
+        sparse_vec = None
+
+    if sparse_vec is not None:
+        # Hybrid: prefetch from both indices, then fuse with RRF.
+        prefetch_limit = max(limit * 4, 20)
+        response = client.query_points(
+            collection_name=collection,
+            prefetch=[
+                models.Prefetch(
+                    query=dense_vector,
+                    using="dense",
+                    limit=prefetch_limit,
+                    filter=query_filter,
+                ),
+                models.Prefetch(
+                    query=sparse_vec,
+                    using="sparse",
+                    limit=prefetch_limit,
+                    filter=query_filter,
+                ),
+            ],
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=limit,
+            with_payload=True,
+        )
+        return response.points, "hybrid"
+
+    # Named-vector dense-only search.
     response = client.query_points(
         collection_name=collection,
-        query=query_vector,
+        query=dense_vector,
+        using="dense",
         limit=limit,
         with_payload=True,
+        query_filter=query_filter,
     )
-    return response.points
+    return response.points, "dense"
 
 
 def build_rag_prompt(message: str, contexts: List[Dict[str, Any]]) -> str:
@@ -662,19 +836,29 @@ def ingest_files_command(args: argparse.Namespace) -> None:
 
 
 def query_documents(args: argparse.Namespace) -> None:
-    results = search_documents(
+    filter_tags = (
+        [t.strip() for t in args.filter_tags.split(",") if t.strip()]
+        if args.filter_tags
+        else None
+    )
+    results, search_mode = search_documents(
         args.query,
         qdrant_url=args.qdrant_url,
         ollama_url=args.ollama_url,
         collection=args.collection,
         model=args.model,
         limit=args.limit,
+        filter_category=args.filter_category,
+        filter_source=args.filter_source,
+        filter_source_type=args.filter_source_type,
+        filter_tags=filter_tags,
     )
 
     if not results:
         print("No results found.")
         return
 
+    print(f"Search mode: {search_mode}")
     for index, result in enumerate(results, start=1):
         payload = result.payload or {}
         title = payload.get("title", "(untitled)")
@@ -749,13 +933,17 @@ def create_rag_app(
     def chat(request: ChatRequest) -> Dict[str, Any]:
         effective_limit = request.limit if request.limit is not None else default_limit
         try:
-            results = search_documents(
+            results, search_mode = search_documents(
                 request.message,
                 qdrant_url=qdrant_url,
                 ollama_url=ollama_url,
                 collection=collection,
                 model=embed_model,
                 limit=effective_limit,
+                filter_category=request.filter_category,
+                filter_source=request.filter_source,
+                filter_source_type=request.filter_source_type,
+                filter_tags=request.filter_tags,
             )
             contexts: List[Dict[str, Any]] = []
             for result in results:
@@ -785,6 +973,7 @@ def create_rag_app(
             "answer": answer,
             "collection": collection,
             "chat_model": chat_model,
+            "search_mode": search_mode,
             "citations": [
                 {
                     "id": item["id"],
@@ -898,6 +1087,11 @@ def serve_chat_endpoint(args: argparse.Namespace) -> None:
             "'pip install -r requirements.txt'."
         ) from exc
 
+    if _sparse_available():
+        print("Hybrid search: enabled (fastembed BM42 detected).")
+    else:
+        print("Hybrid search: disabled (install fastembed to enable).")
+
     app = create_rag_app(
         qdrant_url=args.qdrant_url,
         ollama_url=args.ollama_url,
@@ -984,6 +1178,31 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
     query_parser.add_argument("--query", required=True)
     query_parser.add_argument("--limit", type=int, default=3)
+    query_parser.add_argument(
+        "--filter-category",
+        dest="filter_category",
+        default=None,
+        help="Restrict results to this category value.",
+    )
+    query_parser.add_argument(
+        "--filter-source",
+        dest="filter_source",
+        default=None,
+        help="Restrict results to this source identifier (e.g. whitepaper.pdf).",
+    )
+    query_parser.add_argument(
+        "--filter-source-type",
+        dest="filter_source_type",
+        default=None,
+        choices=["pdf", "markdown", "text", "sample"],
+        help="Restrict results to this source type.",
+    )
+    query_parser.add_argument(
+        "--filter-tags",
+        dest="filter_tags",
+        default=None,
+        help="Comma-separated tag values; all supplied tags must be present.",
+    )
     query_parser.set_defaults(func=query_documents)
 
     traverse_parser = subparsers.add_parser(

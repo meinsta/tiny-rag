@@ -102,8 +102,16 @@
     }
     input[type="text"]:focus, input[type="file"]:focus { border-color: var(--accent); }
     input[type="file"] { padding: 8px 10px; }
+    select {
+      width: 100%; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+      font: inherit; outline: none; cursor: pointer; appearance: none;
+    }
+    select:focus { border-color: var(--accent); }
     .checkbox-row { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
     .checkbox-row input { width: auto; }
+    details summary { cursor: pointer; user-select: none; }
+    details summary::-webkit-details-marker { color: var(--muted); }
     .upload-status { display: grid; gap: 6px; margin-top: 10px; font-size: 13px; }
     .upload-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .upload-row .name { font-weight: 600; }
@@ -183,6 +191,35 @@
           <button id="send">Ask</button>
         </div>
       </div>
+      <details style="margin-top: 12px;">
+        <summary class="small" style="color: var(--muted); padding: 4px 0;">
+          Filters <span style="opacity: 0.6;">(optional — scope search to a category, source type, file, or tag)</span>
+        </summary>
+        <div class="row" style="margin-top: 10px;">
+          <div style="flex: 1 1 130px;">
+            <label for="filter-category">Category</label>
+            <input id="filter-category" type="text" placeholder="e.g. docs" />
+          </div>
+          <div style="flex: 1 1 130px;">
+            <label for="filter-source-type">Source type</label>
+            <select id="filter-source-type">
+              <option value="">all types</option>
+              <option value="pdf">pdf</option>
+              <option value="markdown">markdown</option>
+              <option value="text">text</option>
+              <option value="sample">sample</option>
+            </select>
+          </div>
+          <div style="flex: 2 1 180px;">
+            <label for="filter-source">Source file</label>
+            <input id="filter-source" type="text" placeholder="e.g. whitepaper.pdf" />
+          </div>
+          <div style="flex: 1 1 130px;">
+            <label for="filter-tags">Tag</label>
+            <input id="filter-tags" type="text" placeholder="e.g. pricing" />
+          </div>
+        </div>
+      </details>
     </section>
 
     <section class="card">
@@ -207,6 +244,10 @@
     const $ = (id) => document.getElementById(id);
     const messageEl = $("message");
     const limitEl = $("limit");
+    const filterCategoryEl = $("filter-category");
+    const filterSourceTypeEl = $("filter-source-type");
+    const filterSourceEl = $("filter-source");
+    const filterTagsEl = $("filter-tags");
     const sendEl = $("send");
     const answerEl = $("answer");
     const answerMetaEl = $("answer-meta");
@@ -289,6 +330,15 @@
       if (Number.isFinite(limitRaw) && limitRaw >= 1 && limitRaw <= 10) {
         body.limit = limitRaw;
       }
+      const fc = filterCategoryEl.value.trim();
+      const fst = filterSourceTypeEl.value;
+      const fs = filterSourceEl.value.trim();
+      const ftRaw = filterTagsEl.value.trim();
+      const ft = ftRaw ? ftRaw.split(",").map(t => t.trim()).filter(Boolean) : null;
+      if (fc) body.filter_category = fc;
+      if (fst) body.filter_source_type = fst;
+      if (fs) body.filter_source = fs;
+      if (ft && ft.length > 0) body.filter_tags = ft;
 
       sendEl.disabled = true;
       const oldLabel = sendEl.textContent;
@@ -315,7 +365,8 @@
         }
         const elapsed = ((performance.now() - started) / 1000).toFixed(2);
         answerEl.textContent = data.answer || "(empty answer)";
-        answerMetaEl.textContent = `model: ${data.chat_model} · collection: ${data.collection} · ${elapsed}s`;
+        const mode = data.search_mode || "dense";
+        answerMetaEl.textContent = `model: ${data.chat_model} · collection: ${data.collection} · search: ${mode} · ${elapsed}s`;
         renderCitations(data.citations);
       } catch (e) {
         answerEl.classList.add("err");
