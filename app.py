@@ -1105,7 +1105,7 @@ def serve_chat_endpoint(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Simple Ollama + Qdrant demo with ingest/query/traverse/serve commands."
+        description="Tiny RAG — a small Ollama + Qdrant demo with ingest/query/traverse/serve commands."
     )
     parser.add_argument("--qdrant-url", default=DEFAULT_QDRANT_URL)
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)

@@ -1,5 +1,5 @@
-# Ollama + Qdrant Tiny RAG Demo
-A small, end-to-end retrieval-augmented generation (RAG) demo. Documents are embedded with [Ollama](https://ollama.com), stored in [Qdrant](https://qdrant.tech), and retrieved at query time to ground answers from a local chat model. Includes a CLI, a FastAPI server, and a lightweight browser GUI with PDF / Markdown / text upload.
+# Tiny RAG
+A small, end-to-end retrieval-augmented generation (RAG) demo powered by [Ollama](https://ollama.com) and [Qdrant](https://qdrant.tech). Documents are embedded with Ollama, stored in Qdrant, and retrieved at query time to ground answers from a local chat model. Includes a CLI, a FastAPI server, and a lightweight browser GUI with PDF / Markdown / text upload.
 This README doubles as a developer tutorial: it walks through the ingestion pipeline end-to-end (extract → chunk → embed → upsert), with pointers into `app.py` so you can read the implementation alongside the docs.
 ## What you'll learn
 - How to extract text from PDFs (per-page), Markdown, and plain text.
