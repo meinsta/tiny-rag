@@ -1,11 +1,12 @@
 # Tiny RAG
-A small, end-to-end retrieval-augmented generation (RAG) demo powered by [Ollama](https://ollama.com) and [Qdrant](https://qdrant.tech). Documents are embedded with Ollama, stored in Qdrant, and retrieved at query time to ground answers from a local chat model. Includes a CLI, a FastAPI server, and a lightweight browser GUI with PDF / Markdown / text upload.
+A small, end-to-end retrieval-augmented generation (RAG) demo powered by [Ollama](https://ollama.com) and [Qdrant](https://qdrant.tech). Documents are embedded with Ollama, stored in Qdrant, and retrieved at query time to ground answers from a local chat model. Includes a CLI, a FastAPI server, a lightweight browser GUI with PDF / Markdown / text upload, and optional hybrid (dense + sparse BM42) retrieval.
 This README doubles as a developer tutorial: it walks through the ingestion pipeline end-to-end (extract → chunk → embed → upsert), with pointers into `app.py` so you can read the implementation alongside the docs.
 ## What you'll learn
 - How to extract text from PDFs (per-page), Markdown, and plain text.
 - How to chunk documents into overlapping word windows that fit an embedding model's context.
 - How to design a Qdrant payload that supports filtering, citation rendering, and idempotent re-ingest.
 - How to expose ingest + retrieval over both an HTTP API and a CLI, sharing one pipeline.
+- How to combine dense embeddings with a BM42 sparse vector and fuse them with Reciprocal Rank Fusion (RRF) for hybrid search.
 ## Architecture
 ```
   user ──▶ GUI / curl ──▶ FastAPI (/chat, /ingest)
@@ -13,25 +14,30 @@ This README doubles as a developer tutorial: it walks through the ingestion pipe
                           ├─ /ingest (multipart upload):
                           │    ├─ extract (pypdf for PDF, utf-8 for MD/TXT)
                           │    ├─ chunk   (word window with overlap, page-tracked)
-                          │    ├─ embed   ──▶ Ollama (nomic-embed-text)
-                          │    └─ upsert  ──▶ Qdrant (rich payload per chunk)
+                          │    ├─ embed   ──▶ Ollama (nomic-embed-text)        [dense]
+                          │    │            └▶ fastembed BM42 (optional)      [sparse]
+                          │    └─ upsert  ──▶ Qdrant (named vectors: dense [+ sparse])
                           │
                           └─ /chat (JSON):
-                               ├─ embed query   ──▶ Ollama
+                               ├─ embed query   ──▶ Ollama (+ BM42 if available)
                                ├─ vector search ──▶ Qdrant (ollama_demo_docs)
+                               │                    ├─ hybrid: dense + sparse, fused with RRF
+                               │                    └─ dense:  named-vector dense-only fallback
                                └─ generate      ──▶ Ollama (llama3.2)
 ```
-The ingest pipeline is shared by three entrypoints — the `ingest` CLI (sample JSON), the `ingest-file` CLI (local PDF/MD/TXT), and the `POST /ingest` endpoint — all of which funnel into `ingest_chunks` in `app.py`. The /chat endpoint and `query` CLI share `search_documents`.
+The ingest pipeline is shared by three entrypoints — the `ingest` CLI (sample JSON), the `ingest-file` CLI (local PDF/MD/TXT), and the `POST /ingest` endpoint — all of which funnel into `ingest_chunks` in `app.py`. The /chat endpoint and `query` CLI share `search_documents`, which automatically picks hybrid or dense-only retrieval based on what the collection and runtime support.
 ## Project layout
 - `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`.
 - `static/index.html` — single-file HTML/CSS/JS GUI served by `serve` (upload card + chat box + citations).
 - `sample_data.json` — 8 example documents used by `ingest` (a JSON list of `{id, title, text, category}`).
-- `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`.
+- `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`, plus optional `fastembed` (enables hybrid BM42 search).
 Key symbols inside `app.py`, if you want to read along:
 - `extract_pdf_pages`, `extract_chunks_from_bytes` — file → tokens with optional page numbers.
 - `chunk_words` — word-window chunker with overlap.
-- `ensure_collection`, `_delete_chunks_by_source`, `ingest_chunks` — Qdrant collection + upsert plumbing.
+- `ensure_collection`, `_delete_chunks_by_source`, `ingest_chunks` — Qdrant collection + upsert plumbing (named dense vector, plus a sparse vector when fastembed is installed).
+- `_sparse_available`, `_get_sparse_encoder`, `get_sparse_embedding` — lazy-loaded BM42 sparse encoder used by both ingest and query.
 - `ingest_bytes` — top-level helper used by both the CLI and HTTP layer.
+- `search_documents` — single retrieval entrypoint shared by `query` and `/chat`; returns `(points, search_mode)` where `search_mode` is `"hybrid"` or `"dense"`.
 - `create_rag_app` — FastAPI factory mounting `/chat`, `/ingest`, `/health`, and the static GUI.
 ## Prerequisites
 1. **Python 3.9+**
@@ -39,6 +45,7 @@ Key symbols inside `app.py`, if you want to read along:
 3. **Ollama** running on `http://localhost:11434`
 4. An **embedding model** pulled in Ollama (default: `nomic-embed-text`, ~270 MB)
 5. A **generation model** pulled in Ollama for `serve` (default: `llama3.2`, ~2 GB)
+6. *(Optional)* **fastembed** installed in the venv to enable hybrid (dense + sparse BM42) search. It's listed in `requirements.txt`, so a default `pip install -r requirements.txt` already enables it.
 ### Start Qdrant
 ```bash
 docker run --rm -p 6333:6333 qdrant/qdrant
@@ -63,7 +70,7 @@ This walks you from an empty Qdrant to a grounded chat response over your own do
 ```bash
 python app.py ingest
 ```
-This drops + recreates the collection `ollama_demo_docs` with cosine distance and ingests `sample_data.json` through the unified chunk pipeline. Output looks like:
+This drops + recreates the collection `ollama_demo_docs` with a named `dense` vector (cosine distance) and, if `fastembed` is installed, a `sparse` BM42 vector alongside it. It then ingests `sample_data.json` through the unified chunk pipeline. Output looks like:
 ```
 Ingested 8 chunks across 8 sample documents into collection 'ollama_demo_docs' using model 'nomic-embed-text'.
 ```
@@ -85,7 +92,8 @@ Scrolls through points and prints `id`, `category`, `title`, and a text preview 
 ```bash
 python app.py query --query "What does the whitepaper say about pricing?" --limit 3
 ```
-or start the server and use the chat endpoint:
+The CLI prints `Search mode: hybrid` (when fastembed + a sparse-enabled collection are both available) or `Search mode: dense` otherwise, followed by the top results.
+Or start the server and use the chat endpoint:
 ```bash
 python app.py serve
 # then, in another shell:
@@ -93,7 +101,7 @@ curl -s http://127.0.0.1:8000/chat \
   -H 'Content-Type: application/json' \
   -d '{"message": "What does the whitepaper say about pricing?", "limit": 3}'
 ```
-The response includes `answer` plus `citations[]` with `source`, `page_start`/`page_end`, `chunk_index`, and a text preview — enough to render "go to page N of file X" UI.
+On startup `serve` also prints `Hybrid search: enabled` or `Hybrid search: disabled (install fastembed to enable).`. The response includes `answer`, a `search_mode` field (`"hybrid"` or `"dense"`), plus `citations[]` with `source`, `page_start`/`page_end`, `chunk_index`, and a text preview — enough to render "go to page N of file X" UI.
 ### Step 5 — Open the GUI
 With `python app.py serve` running, open <http://127.0.0.1:8000>. The page has an **Add documents** card (file picker, category, tags, chunk size/overlap, replace toggle) and a chat box that surfaces citations inline.
 ## Ingestion deep dive
@@ -116,21 +124,32 @@ Validations: `chunk_size > 0`, `0 ≤ chunk_overlap < chunk_size`. If you pass i
  chunk 0:      [w0 ............ w399]               size=400
  chunk 1:                  [w350 ............ w749] overlap=50, step=350
 ```
-### 3. Embedding (`get_embedding`)
-Calls Ollama's `/api/embed` (preferred) and falls back to `/api/embeddings` for older versions. Returns a `list[float]`. The vector size is discovered lazily from the first chunk on each ingest, so swapping embedding models "just works" for a fresh collection.
-Today this is sequential (one HTTP call per chunk). For larger corpora you can batch by sending an `input: [...]` list to `/api/embed`; the surface area is small enough that the change lives entirely in `ingest_chunks`.
+### 3. Embedding (`get_embedding` + `get_sparse_embedding`)
+`get_embedding` calls Ollama's `/api/embed` (preferred) and falls back to `/api/embeddings` for older versions. Returns a `list[float]`. The dense vector size is discovered lazily from the first chunk on each ingest, so swapping embedding models "just works" for a fresh collection.
+When `fastembed` is installed, `get_sparse_embedding` lazy-loads the `Qdrant/bm42-all-minilm-l6-v2-attentions` BM42 encoder (cached at module level) and returns a `models.SparseVector` per chunk. If fastembed is missing, sparse generation is silently skipped and the demo continues in dense-only mode.
+Today dense embedding is sequential (one HTTP call per chunk). For larger corpora you can batch by sending an `input: [...]` list to `/api/embed`; the surface area is small enough that the change lives entirely in `ingest_chunks`.
 ### 4. Collection management (`ensure_collection`)
-- If the collection doesn't exist, it's created with `VectorParams(size=<vector_size>, distance=Distance.COSINE)`.
-- If it exists and the existing vector size differs from what the current model produces, you get a clear error pointing at the model mismatch (instead of a confusing upsert failure later).
-This is also the natural place to plug in payload indexes (`client.create_payload_index(...)`) when you start filtering on `source`, `category`, `tags`, or `created_at`, and to declare sparse vectors for hybrid search.
+- If the collection doesn't exist, it's created with **named vectors**: a `dense` `VectorParams(size=<vector_size>, distance=Distance.COSINE)`. When `fastembed` is available, a `sparse` `SparseVectorParams()` config is added alongside it so Qdrant can store BM42 vectors per point.
+- Keyword payload indexes are created for `category`, `source`, `source_type`, and `tags` so filtered search stays fast.
+- If the collection already exists with the legacy unnamed-vector layout (older builds of this demo), `ensure_collection` raises a clear error telling you to drop and recreate it via `python app.py ingest`.
+- If the collection exists and its `dense` vector size differs from what the current model produces, you get a clear error pointing at the model mismatch (instead of a confusing upsert failure later).
 ### 5. Upsert (`ingest_chunks`)
 For each chunk:
-- Embed it with Ollama.
+- Embed it with Ollama (dense vector).
+- If `fastembed` is installed, also produce a BM42 sparse vector via `get_sparse_embedding`.
 - Build a payload (see schema below).
 - Compute a deterministic point id: `uuid5(namespace, f"{source}#{chunk_index}")`. This means re-ingesting the same source overwrites the previous chunks one-for-one — the upsert is idempotent.
+- Upsert the point with named vectors `{"dense": <vec>}`, plus `"sparse": <SparseVector>` when available.
 If `replace_existing=True` (the default for `ingest-file` and `POST /ingest`), `_delete_chunks_by_source` first removes any prior chunks with the same `source` filter so renamed/shortened documents don't leave orphan chunks behind.
 ### 6. Re-use across entrypoints (`ingest_bytes`)
 `ingest_bytes` is the single function the CLI (`ingest_files_command`) and HTTP layer (`POST /ingest`) both call. It returns an `IngestReport` with `source`, `title`, `source_type`, `chunks_ingested`, `pages`, and an optional `skipped_reason` — that's also what the HTTP response surfaces per-file. The sample-JSON path (`ingest_documents`) goes through `ingest_chunks` directly so its payload schema matches uploaded files exactly.
+## Retrieval (`search_documents`)
+`search_documents` is the single retrieval function shared by the `query` CLI and the `POST /chat` endpoint. It always embeds the query with Ollama for the dense side, then inspects the target collection to decide how to search. It returns `(points, search_mode)` where `search_mode` is `"hybrid"` or `"dense"`.
+Mode selection:
+- **hybrid** — chosen when the collection was created with both `dense` and `sparse` named vectors and `fastembed` is importable at query time. The function generates a BM42 sparse vector for the query and issues a single `client.query_points` call that prefetches from each index (`limit = max(limit * 4, 20)`) and fuses the results with `models.FusionQuery(fusion=models.Fusion.RRF)`. Reciprocal Rank Fusion lets sparse keyword matches and dense semantic matches each pull in their best candidates without one having to dominate.
+- **dense** — used when the collection has no `sparse` config, when `fastembed` isn't installed, or when sparse encoding fails. The query runs against the named `dense` vector with `using="dense"`.
+- **legacy fallback** — if the collection still has the old unnamed-vector schema, `search_documents` issues an unnamespaced dense query so existing data keeps working until you re-ingest.
+A single payload `Filter` (built by `build_filter`) is applied uniformly across both prefetch branches in hybrid mode, so filter semantics don't change with the search mode.
 ## Chunk payload schema
 Every point upserted into Qdrant carries the following payload. Fields beyond the basics are what enable filtering, page-jump UI, and re-ingest by source:
 - `title` — display title (filename stem for uploads, JSON `title` for sample docs)
@@ -169,7 +188,7 @@ python app.py ingest-file PATH [PATH ...] \
 ```bash
 python app.py query --query "…" [--limit 3] [--collection NAME]
 ```
-Prints the top results with score, id, title, category, and a text preview.
+Prints `Search mode: hybrid` or `Search mode: dense` (see [Retrieval](#retrieval-search_documents)) followed by the top results with score, id, title, category, and a text preview.
 ### `traverse` — scroll through stored points
 ```bash
 python app.py traverse [--batch-size 4] [--limit 0] [--collection NAME]
@@ -200,6 +219,7 @@ Response:
   "answer": "…model output grounded in the retrieved chunks…",
   "collection": "ollama_demo_docs",
   "chat_model": "llama3.2",
+  "search_mode": "hybrid",
   "citations": [
     {
       "id": "…uuid…",
@@ -217,6 +237,7 @@ Response:
   ]
 }
 ```
+`search_mode` is `"hybrid"` when the collection was created with sparse vectors and `fastembed` is installed; otherwise it is `"dense"`. In hybrid mode `score` is the RRF-fused score, not a cosine similarity.
 ### `POST /ingest`
 Multipart form. Field reference:
 - `files` (repeated, required) — one or more `.pdf`, `.md`, `.markdown`, or `.txt` files. 25 MB per file.
@@ -260,12 +281,15 @@ CLI flags always override env vars.
 ## Extending the demo
 A few directions the code is structured to support:
 - **Payload filtering.** The payload schema already includes `source`, `category`, `tags`, `source_type`, and `created_at`. Add `client.create_payload_index(...)` calls in `ensure_collection` and pass a `models.Filter` to `client.query_points` in `search_documents`.
-- **Hybrid (dense + sparse) search.** `ensure_collection` is the single place that declares vector config; extend it to also configure a sparse vector (e.g. BM25) and emit a sparse vector per chunk inside `ingest_chunks`.
+- **Swap the sparse encoder.** Hybrid retrieval is wired through `_get_sparse_encoder` / `get_sparse_embedding`; point them at a different fastembed model (or a custom encoder that returns `(indices, values)`) to experiment with BM25, SPLADE, etc. Re-ingest after swapping so stored sparse vectors match the query encoder.
+- **Tune the fusion.** `search_documents` uses `models.Fusion.RRF` with prefetch limit `max(limit * 4, 20)`. Try other fusion methods or weight the prefetches differently if you want one signal to dominate.
 - **Batched embeddings.** Replace the per-chunk `get_embedding` loop in `ingest_chunks` with a batched call to Ollama's `/api/embed` (which accepts `input: [...]`). The rest of the pipeline doesn't need to change.
 - **New file formats.** Add an extractor that returns a `List[(word, page_or_none)]` and one branch in `extract_chunks_from_bytes`.
 ## Troubleshooting
 - **`zsh: command not found: python`** — use `python3` or the venv's interpreter (`./.venv/bin/python`).
 - **`ModuleNotFoundError: No module named 'fastapi'` / `pypdf` / `multipart`** — the venv isn't active or deps aren't installed. Run `source .venv/bin/activate && pip install -r requirements.txt`, or call `./.venv/bin/python app.py …`.
+- **Search mode is stuck on `dense` even though I want hybrid.** Either `fastembed` isn't installed in the active interpreter (re-run `pip install -r requirements.txt` and confirm with `python -c "import fastembed"`), or the collection was created before fastembed was installed and therefore has no `sparse` vector config. Drop the collection (e.g. `python app.py ingest`) so it's recreated with both `dense` and `sparse` configs and re-ingest your documents.
+- **`Collection '…' was created with an older unnamed-vector schema`** — the collection predates the named-vector layout used for hybrid search. Drop and recreate it via `python app.py ingest`.
 - **`/ingest` returns `No extractable text found`** — the PDF is likely scanned images. Run it through OCR (e.g. `ocrmypdf input.pdf output.pdf`) and re-upload.
 - **`/ingest` returns a vector-size error** — the collection was created with a different embedding model. Drop the collection (`python app.py ingest` recreates it) or switch back to the matching `--model`.
 - **`/chat` returns `Unable to generate embeddings from Ollama`** — Ollama isn't running, or the embedding model isn't pulled. Check with `curl http://localhost:11434/api/tags` and `ollama list`.
