@@ -207,6 +207,118 @@ def format_preview(text: str, max_length: int = 120) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Quantization helpers
+# ---------------------------------------------------------------------------
+
+# CLI mode names. "none" disables quantization; the rest map onto Qdrant's
+# scalar (int8), binary (1 bit/dim), and product (PQ x16) configs.
+QUANTIZATION_MODES: Tuple[str, ...] = ("none", "scalar", "binary", "product")
+
+
+def build_quantization_config(
+    mode: str, *, always_ram: bool = True
+) -> Optional[Any]:
+    """Translate a CLI mode string into a Qdrant quantization config object.
+
+    Returns None for ``mode='none'``. Defaults follow Qdrant's docs:
+      - scalar:  int8 with quantile=0.99 (good general default)
+      - binary:  1 bit per dimension (works best on >=1024-dim embeddings)
+      - product: x16 compression (largest savings, lowest recall)
+
+    ``always_ram=True`` keeps the *quantized* vectors resident in RAM so queries
+    stay fast even when the original full-precision vectors live on disk.
+    """
+    mode_norm = (mode or "none").lower()
+    if mode_norm == "none":
+        return None
+    if mode_norm == "scalar":
+        return models.ScalarQuantization(
+            scalar=models.ScalarQuantizationConfig(
+                type=models.ScalarType.INT8,
+                quantile=0.99,
+                always_ram=always_ram,
+            )
+        )
+    if mode_norm == "binary":
+        return models.BinaryQuantization(
+            binary=models.BinaryQuantizationConfig(always_ram=always_ram)
+        )
+    if mode_norm == "product":
+        return models.ProductQuantization(
+            product=models.ProductQuantizationConfig(
+                compression=models.CompressionRatio.X16,
+                always_ram=always_ram,
+            )
+        )
+    raise ValueError(
+        f"Unknown quantization mode '{mode}'. "
+        f"Choose from: {', '.join(QUANTIZATION_MODES)}"
+    )
+
+
+def detect_quantization_mode(info: Any) -> str:
+    """Inspect a CollectionInfo object and return one of QUANTIZATION_MODES."""
+    qcfg = getattr(getattr(info, "config", None), "quantization_config", None)
+    if qcfg is None:
+        return "none"
+    if getattr(qcfg, "scalar", None) is not None:
+        return "scalar"
+    if getattr(qcfg, "binary", None) is not None:
+        return "binary"
+    if getattr(qcfg, "product", None) is not None:
+        return "product"
+    return "none"
+
+
+def estimate_vector_bytes(num_points: int, dim: int, mode: str) -> int:
+    """Lower-bound estimate of dense-vector storage in bytes.
+
+    Sparse vectors, HNSW graph links, payload indexes, and segment overhead
+    are NOT included — the goal is a clean apples-to-apples comparison of the
+    raw vector storage cost across quantization modes.
+    """
+    if dim < 0 or num_points < 0:
+        raise ValueError("num_points and dim must be non-negative")
+    if mode == "none":
+        return num_points * dim * 4  # float32
+    if mode == "scalar":
+        return num_points * dim  # int8
+    if mode == "binary":
+        return num_points * ((dim + 7) // 8)  # 1 bit per dim, byte-aligned
+    if mode == "product":
+        return (num_points * dim * 4) // 16  # X16 compression
+    raise ValueError(f"Unknown mode: {mode}")
+
+
+def format_bytes(n: float) -> str:
+    """Render a byte count using the largest unit that yields a value < 1024."""
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1024:
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PB"
+
+
+def build_quantization_search_params(
+    rescore: Optional[bool], oversampling: Optional[float]
+) -> Optional[models.SearchParams]:
+    """Construct a SearchParams object that tunes quantized re-scoring.
+
+    Returns None when neither knob is provided so callers can omit the
+    ``search_params`` argument entirely on collections without quantization.
+    """
+    if rescore is None and oversampling is None:
+        return None
+    return models.SearchParams(
+        quantization=models.QuantizationSearchParams(
+            rescore=rescore if rescore is not None else True,
+            oversampling=oversampling if oversampling is not None else 1.0,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Extraction + chunking pipeline
 # ---------------------------------------------------------------------------
 
@@ -384,9 +496,19 @@ def _deterministic_point_id(source: str, chunk_index: int) -> str:
 
 
 def ensure_collection(
-    client: QdrantClient, collection: str, vector_size: int
+    client: QdrantClient,
+    collection: str,
+    vector_size: int,
+    *,
+    quantization_config: Optional[Any] = None,
 ) -> None:
-    """Create the collection if missing; verify vector size if it already exists."""
+    """Create the collection if missing; verify vector size if it already exists.
+
+    ``quantization_config`` is applied only when the collection is being created.
+    For existing collections, use ``python app.py quantize`` to update it in
+    place — a warning is printed when a quantization config is supplied but
+    ignored, so SAs don't silently keep the old setting.
+    """
     if client.collection_exists(collection):
         info = client.get_collection(collection)
         vectors_cfg = info.config.params.vectors
@@ -407,6 +529,15 @@ def ensure_collection(
                 f"vectors of size {vector_size}. Drop the collection or pick a "
                 "matching model before ingesting."
             )
+
+        if quantization_config is not None:
+            current_mode = detect_quantization_mode(info)
+            print(
+                f"  note: collection '{collection}' already exists with "
+                f"quantization='{current_mode}'. Ignoring --quantization for "
+                "this ingest. Run 'python app.py quantize --mode <mode>' to "
+                "change it in place."
+            )
         return
 
     sparse_config = (
@@ -420,6 +551,7 @@ def ensure_collection(
             )
         },
         sparse_vectors_config=sparse_config,
+        quantization_config=quantization_config,
     )
 
     # Keyword payload indexes for efficient filtered search.
@@ -464,6 +596,7 @@ def ingest_chunks(
     chunks: Sequence[Chunk],
     replace_existing: bool,
     extra_payload: Optional[Dict[str, Any]] = None,
+    quantization_config: Optional[Any] = None,
 ) -> int:
     """Embed chunks via Ollama and upsert them into Qdrant with rich payload.
 
@@ -475,7 +608,12 @@ def ingest_chunks(
     # Probe vector size from the first chunk so we can lazily create the
     # collection on the very first ingest call.
     first_vector = get_embedding(chunks[0].text, embed_model, ollama_url)
-    ensure_collection(client, collection, len(first_vector))
+    ensure_collection(
+        client,
+        collection,
+        len(first_vector),
+        quantization_config=quantization_config,
+    )
 
     if replace_existing:
         _delete_chunks_by_source(client, collection, source)
@@ -534,6 +672,7 @@ def ingest_bytes(
     replace_existing: bool,
     chunk_size: int = DEFAULT_CHUNK_WORDS,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+    quantization_config: Optional[Any] = None,
 ) -> IngestReport:
     """Top-level helper: bytes -> chunks -> embed -> upsert. Used by HTTP + CLI."""
     chunks, source_type, page_count = extract_chunks_from_bytes(
@@ -571,6 +710,7 @@ def ingest_bytes(
         chunks=chunks,
         replace_existing=replace_existing,
         extra_payload={"page_count": page_count} if page_count is not None else None,
+        quantization_config=quantization_config,
     )
     return IngestReport(
         source=source,
@@ -628,11 +768,18 @@ def search_documents(
     filter_source: Optional[str] = None,
     filter_source_type: Optional[str] = None,
     filter_tags: Optional[List[str]] = None,
+    rescore: Optional[bool] = None,
+    oversampling: Optional[float] = None,
 ) -> Tuple[List[Any], str]:
     """Return (points, search_mode).
 
     search_mode is 'hybrid' when dense and sparse vectors are fused via RRF,
     or 'dense' when only the dense vector is used.
+
+    ``rescore`` and ``oversampling`` are passed through to Qdrant's quantization
+    search params. They have no effect on collections without quantization but
+    are safe to set unconditionally — use them to demo recall vs latency on a
+    quantized collection.
     """
     client = QdrantClient(url=qdrant_url)
     dense_vector = get_embedding(query, model, ollama_url)
@@ -642,6 +789,7 @@ def search_documents(
         source_type=filter_source_type,
         tags=filter_tags,
     )
+    search_params = build_quantization_search_params(rescore, oversampling)
 
     # Inspect the collection's vector configuration.
     has_sparse = False
@@ -664,6 +812,7 @@ def search_documents(
             limit=limit,
             with_payload=True,
             query_filter=query_filter,
+            search_params=search_params,
         )
         return response.points, "dense"
 
@@ -674,6 +823,8 @@ def search_documents(
 
     if sparse_vec is not None:
         # Hybrid: prefetch from both indices, then fuse with RRF.
+        # Quantization tuning only applies to the dense prefetch — sparse
+        # vectors are not quantized.
         prefetch_limit = max(limit * 4, 20)
         response = client.query_points(
             collection_name=collection,
@@ -683,6 +834,7 @@ def search_documents(
                     using="dense",
                     limit=prefetch_limit,
                     filter=query_filter,
+                    params=search_params,
                 ),
                 models.Prefetch(
                     query=sparse_vec,
@@ -705,6 +857,7 @@ def search_documents(
         limit=limit,
         with_payload=True,
         query_filter=query_filter,
+        search_params=search_params,
     )
     return response.points, "dense"
 
@@ -746,6 +899,11 @@ def ingest_documents(args: argparse.Namespace) -> None:
     if client.collection_exists(args.collection):
         client.delete_collection(args.collection)
 
+    quantization_mode = getattr(args, "quantization", "none")
+    quantization_config = build_quantization_config(
+        quantization_mode, always_ram=getattr(args, "always_ram", True)
+    )
+
     total_chunks = 0
     for doc in documents:
         body = f"{doc['title']}\n{doc['text']}"
@@ -771,11 +929,16 @@ def ingest_documents(args: argparse.Namespace) -> None:
             chunks=chunks,
             replace_existing=False,  # collection was just dropped
             extra_payload={"sample_id": doc["id"]},
+            # Only the first ingest call actually creates the collection;
+            # subsequent calls hit the existing-collection branch in
+            # ensure_collection and silently ignore quantization_config.
+            quantization_config=quantization_config,
         )
 
     print(
         f"Ingested {total_chunks} chunks across {len(documents)} sample documents "
-        f"into collection '{args.collection}' using model '{args.model}'."
+        f"into collection '{args.collection}' using model '{args.model}' "
+        f"(quantization={quantization_mode})."
     )
 
 
@@ -788,6 +951,10 @@ def ingest_files_command(args: argparse.Namespace) -> None:
 
     tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
     client = QdrantClient(url=args.qdrant_url)
+    quantization_config = build_quantization_config(
+        getattr(args, "quantization", "none"),
+        always_ram=getattr(args, "always_ram", True),
+    )
 
     total_chunks = 0
     for path in paths:
@@ -815,6 +982,7 @@ def ingest_files_command(args: argparse.Namespace) -> None:
                 replace_existing=args.replace,
                 chunk_size=args.chunk_size,
                 chunk_overlap=args.chunk_overlap,
+                quantization_config=quantization_config,
             )
         except (ValueError, RuntimeError) as exc:
             print(f"  failed {path.name}: {exc}")
@@ -852,6 +1020,8 @@ def query_documents(args: argparse.Namespace) -> None:
         filter_source=args.filter_source,
         filter_source_type=args.filter_source_type,
         filter_tags=filter_tags,
+        rescore=getattr(args, "rescore", None),
+        oversampling=getattr(args, "oversampling", None),
     )
 
     if not results:
@@ -868,6 +1038,106 @@ def query_documents(args: argparse.Namespace) -> None:
         print(f"   title: {title}")
         print(f"   category: {category}")
         print(f"   text: {preview}")
+
+
+def memory_report(args: argparse.Namespace) -> None:
+    """Print a side-by-side memory estimate across all quantization modes.
+
+    Useful for SAs demoing the quantization tradeoff: same collection, four
+    storage profiles, the active one called out so the customer sees what
+    they're getting today vs. what they could get.
+    """
+    client = QdrantClient(url=args.qdrant_url)
+    if not client.collection_exists(args.collection):
+        raise RuntimeError(
+            f"Collection '{args.collection}' does not exist. Ingest first."
+        )
+
+    info = client.get_collection(args.collection)
+    points = client.count(args.collection, exact=True).count
+
+    vectors_cfg = info.config.params.vectors
+    if isinstance(vectors_cfg, dict):
+        dense_cfg = vectors_cfg.get("dense")
+    else:
+        dense_cfg = vectors_cfg
+    dim = getattr(dense_cfg, "size", None) if dense_cfg else None
+    distance = getattr(dense_cfg, "distance", None) if dense_cfg else None
+
+    has_sparse = bool(getattr(info.config.params, "sparse_vectors", None))
+    active_mode = detect_quantization_mode(info)
+
+    print(f"Collection: {args.collection}")
+    print(f"  status:               {info.status}")
+    print(f"  segments:             {info.segments_count}")
+    print(f"  points:               {points}")
+    print(f"  dense vector size:    {dim}")
+    print(f"  distance:             {distance}")
+    print(f"  sparse vectors:       {'yes' if has_sparse else 'no'}")
+    print(f"  active quantization:  {active_mode}")
+
+    if not dim or not points:
+        print("\nSkipping memory estimates (collection has no vectors yet).")
+        return
+
+    full_bytes = estimate_vector_bytes(points, dim, "none")
+    print()
+    print("Estimated dense-vector RAM by mode (lower bound, vectors only):")
+    print(f"  {'mode':8s}  {'size':>10s}   ratio vs full")
+    for mode in QUANTIZATION_MODES:
+        size = estimate_vector_bytes(points, dim, mode)
+        marker = "  <- active" if mode == active_mode else ""
+        ratio = full_bytes / size if size else float("inf")
+        print(
+            f"  {mode:8s}  {format_bytes(size):>10s}   {ratio:5.1f}x{marker}"
+        )
+
+    if active_mode != "none":
+        active_bytes = estimate_vector_bytes(points, dim, active_mode)
+        saved = full_bytes - active_bytes
+        pct = (saved / full_bytes) * 100 if full_bytes else 0
+        print()
+        print(
+            f"Active quantization saves {format_bytes(saved)} "
+            f"({pct:.1f}% vs full precision)."
+        )
+
+    print()
+    print(
+        "Note: estimates cover dense quantized vectors only. Original "
+        "full-precision vectors and HNSW graph links are stored separately."
+    )
+
+
+def quantize_collection(args: argparse.Namespace) -> None:
+    """Apply quantization to an existing collection in-place via update_collection.
+
+    Qdrant re-quantizes existing segments asynchronously; running ``memory``
+    a few seconds later is a reliable way to verify the change took effect.
+    """
+    client = QdrantClient(url=args.qdrant_url)
+    if not client.collection_exists(args.collection):
+        raise RuntimeError(
+            f"Collection '{args.collection}' does not exist. Ingest first."
+        )
+
+    if args.mode == "none":
+        raise RuntimeError(
+            "Disabling quantization in-place is not supported by this CLI. "
+            "Recreate the collection via 'python app.py ingest' (with no "
+            "--quantization flag) to clear it."
+        )
+
+    qcfg = build_quantization_config(args.mode, always_ram=args.always_ram)
+    client.update_collection(
+        collection_name=args.collection,
+        quantization_config=qcfg,
+    )
+    print(
+        f"Applied {args.mode} quantization (always_ram={args.always_ram}) "
+        f"to collection '{args.collection}'. Re-quantization runs in the "
+        "background; rerun 'python app.py memory' to verify."
+    )
 
 
 def traverse_documents(args: argparse.Namespace) -> None:
@@ -1130,6 +1400,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CHUNK_OVERLAP,
         help="Words of overlap between consecutive chunks (default: %(default)s).",
     )
+    ingest_parser.add_argument(
+        "--quantization",
+        choices=list(QUANTIZATION_MODES),
+        default="none",
+        help=(
+            "Quantization mode applied when (re)creating the collection "
+            "(default: %(default)s). Use 'memory' afterwards to compare RAM costs."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--always-ram",
+        dest="always_ram",
+        action="store_true",
+        default=True,
+        help="Keep quantized vectors in RAM (default).",
+    )
+    ingest_parser.add_argument(
+        "--no-always-ram",
+        dest="always_ram",
+        action="store_false",
+        help="Allow quantized vectors to live on disk.",
+    )
     ingest_parser.set_defaults(func=ingest_documents)
 
     ingest_file_parser = subparsers.add_parser(
@@ -1164,6 +1456,29 @@ def build_parser() -> argparse.ArgumentParser:
         dest="replace",
         action="store_false",
         help="Do NOT delete existing chunks for the same source before upserting.",
+    )
+    ingest_file_parser.add_argument(
+        "--quantization",
+        choices=list(QUANTIZATION_MODES),
+        default="none",
+        help=(
+            "Quantization mode for the collection. Only applies when the "
+            "collection is being created; ignored (with a warning) on "
+            "existing collections — use 'quantize' to retrofit instead."
+        ),
+    )
+    ingest_file_parser.add_argument(
+        "--always-ram",
+        dest="always_ram",
+        action="store_true",
+        default=True,
+        help="Keep quantized vectors in RAM (default).",
+    )
+    ingest_file_parser.add_argument(
+        "--no-always-ram",
+        dest="always_ram",
+        action="store_false",
+        help="Allow quantized vectors to live on disk.",
     )
     ingest_file_parser.set_defaults(replace=True, func=ingest_files_command)
     ingest_file_parser.add_argument(
@@ -1203,6 +1518,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated tag values; all supplied tags must be present.",
     )
+    query_parser.add_argument(
+        "--rescore",
+        dest="rescore",
+        action="store_true",
+        default=None,
+        help=(
+            "On quantized collections, re-score the top candidates with the "
+            "original full-precision vectors (default Qdrant behavior). "
+            "Pair with --oversampling for a recall demo."
+        ),
+    )
+    query_parser.add_argument(
+        "--no-rescore",
+        dest="rescore",
+        action="store_false",
+        help="Skip full-precision re-scoring — fastest, lowest recall.",
+    )
+    query_parser.add_argument(
+        "--oversampling",
+        type=float,
+        default=None,
+        help=(
+            "Multiplier for how many quantized candidates to fetch before "
+            "re-scoring (e.g. 2.0). Higher = better recall, slower. Only "
+            "meaningful on quantized collections."
+        ),
+    )
     query_parser.set_defaults(func=query_documents)
 
     traverse_parser = subparsers.add_parser(
@@ -1229,6 +1571,42 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.set_defaults(func=serve_chat_endpoint)
+
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help=(
+            "Print collection stats and a side-by-side memory estimate "
+            "across all quantization modes."
+        ),
+    )
+    memory_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    memory_parser.set_defaults(func=memory_report)
+
+    quantize_parser = subparsers.add_parser(
+        "quantize",
+        help="Apply quantization to an existing collection in-place.",
+    )
+    quantize_parser.add_argument("--collection", default=DEFAULT_COLLECTION)
+    quantize_parser.add_argument(
+        "--mode",
+        required=True,
+        choices=[m for m in QUANTIZATION_MODES if m != "none"],
+        help="Quantization mode to apply (scalar/binary/product).",
+    )
+    quantize_parser.add_argument(
+        "--always-ram",
+        dest="always_ram",
+        action="store_true",
+        default=True,
+        help="Keep quantized vectors in RAM (default).",
+    )
+    quantize_parser.add_argument(
+        "--no-always-ram",
+        dest="always_ram",
+        action="store_false",
+        help="Allow quantized vectors to live on disk.",
+    )
+    quantize_parser.set_defaults(func=quantize_collection)
 
     return parser
 

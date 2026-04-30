@@ -27,7 +27,7 @@ This README doubles as a developer tutorial: it walks through the ingestion pipe
 ```
 The ingest pipeline is shared by three entrypoints — the `ingest` CLI (sample JSON), the `ingest-file` CLI (local PDF/MD/TXT), and the `POST /ingest` endpoint — all of which funnel into `ingest_chunks` in `app.py`. The /chat endpoint and `query` CLI share `search_documents`, which automatically picks hybrid or dense-only retrieval based on what the collection and runtime support.
 ## Project layout
-- `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`.
+- `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`, `memory`, `quantize`.
 - `static/index.html` — single-file HTML/CSS/JS GUI served by `serve` (upload card + chat box + citations).
 - `sample_data.json` — 8 example documents used by `ingest` (a JSON list of `{id, title, text, category}`).
 - `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`, plus optional `fastembed` (enables hybrid BM42 search).
@@ -170,25 +170,31 @@ All commands accept the global flags `--qdrant-url`, `--ollama-url`, and `--mode
 ### `ingest` — load `sample_data.json` (clean-slate)
 ```bash
 python app.py ingest [--collection NAME] [--data-file PATH] \
-                     [--chunk-size 400] [--chunk-overlap 50]
+                     [--chunk-size 400] [--chunk-overlap 50] \
+                     [--quantization {none,scalar,binary,product}] \
+                     [--no-always-ram]
 ```
-Drops + recreates the collection, then ingests every document in the data file through the unified chunk pipeline. Override `--data-file` to point at any JSON list of `{id, title, text, category}` objects.
+Drops + recreates the collection, then ingests every document in the data file through the unified chunk pipeline. Override `--data-file` to point at any JSON list of `{id, title, text, category}` objects. `--quantization` (default `none`) is applied at collection-create time. `--always-ram` is on by default so the quantized vectors stay resident in RAM — pass `--no-always-ram` to allow them on disk.
 ### `ingest-file` — chunk + embed local PDF / MD / TXT files
 ```bash
 python app.py ingest-file PATH [PATH ...] \
   [--collection NAME] [--category LABEL] [--tags a,b,c] \
-  [--chunk-size 400] [--chunk-overlap 50] [--no-replace]
+  [--chunk-size 400] [--chunk-overlap 50] [--no-replace] \
+  [--quantization {none,scalar,binary,product}] [--no-always-ram]
 ```
 - The collection is created lazily if it doesn't exist.
 - Existing chunks for the same source filename are replaced by default; pass `--no-replace` to keep them.
 - Supported extensions: `.pdf`, `.md`, `.markdown`, `.txt`.
 - Per-file size limit: 25 MB (oversize files are skipped with a printed reason).
 - Files that yield no extractable text (e.g. scanned PDFs without OCR) are skipped with a printed reason.
+- `--quantization` is honored only when the collection is being created. If the collection already exists, the flag is ignored and a note is printed; use `python app.py quantize` to retrofit an existing collection in-place.
 ### `query` — semantic search
 ```bash
-python app.py query --query "…" [--limit 3] [--collection NAME]
+python app.py query --query "…" [--limit 3] [--collection NAME] \
+                    [--rescore | --no-rescore] [--oversampling 2.0]
 ```
 Prints `Search mode: hybrid` or `Search mode: dense` (see [Retrieval](#retrieval-search_documents)) followed by the top results with score, id, title, category, and a text preview.
+`--rescore` / `--no-rescore` and `--oversampling` are passed through as Qdrant `QuantizationSearchParams` and only affect collections that have quantization configured. The recall demo: run the same query first with `--no-rescore` (fast, lower recall), then with `--rescore --oversampling 2.0` (slower, recall close to full precision).
 ### `traverse` — scroll through stored points
 ```bash
 python app.py traverse [--batch-size 4] [--limit 0] [--collection NAME]
@@ -200,6 +206,36 @@ python app.py serve [--collection NAME] [--chat-model llama3.2] \
                     [--retrieval-limit 3] [--host 127.0.0.1] [--port 8000]
 ```
 Mounts `/`, `/health`, `/chat`, `/ingest`, and `/docs`. See the HTTP API section below.
+### `memory` — collection stats + side-by-side quantization estimate
+```bash
+python app.py memory [--collection NAME]
+```
+Prints status, segment count, point count, dense vector size, distance, sparse-vector flag, and active quantization mode. Then renders an apples-to-apples RAM estimate of the dense vectors under each quantization mode (none / scalar / binary / product) with the active mode marked. Use this before and after `quantize` to demo the savings.
+Example output:
+```
+Collection: ollama_demo_docs
+  status:               green
+  segments:             2
+  points:               412
+  dense vector size:    768
+  distance:             Cosine
+  sparse vectors:       yes
+  active quantization:  scalar
+Estimated dense-vector RAM by mode (lower bound, vectors only):
+  mode             size   ratio vs full
+  none          1.21 MB     1.0x
+  scalar      309.00 KB     4.0x  <- active
+  binary       38.62 KB    32.0x
+  product      77.25 KB    16.0x
+Active quantization saves 927.00 KB (75.0% vs full precision).
+```
+Estimates cover dense quantized vectors only; HNSW graph links and full-precision originals are stored separately.
+### `quantize` — apply quantization to an existing collection in-place
+```bash
+python app.py quantize --mode {scalar|binary|product} [--no-always-ram] \
+                       [--collection NAME]
+```
+Calls `client.update_collection(quantization_config=...)` so existing data is re-quantized in the background — no re-ingest required. Use `memory` a few seconds later to verify. To disable quantization entirely, drop the collection (e.g. `python app.py ingest`) and recreate without `--quantization`.
 ## HTTP API reference
 ### `GET /` — browser GUI
 Serves `static/index.html`: an upload card (files, category, tags, chunk size/overlap, replace toggle) and a chat box that renders citations inline. ⌘/Ctrl+Enter sends from the textarea.
@@ -278,6 +314,28 @@ FastAPI's auto-generated Swagger UI for `/chat` and `/ingest`.
 - `OLLAMA_MODEL` — embedding model, default `nomic-embed-text`
 - `OLLAMA_CHAT_MODEL` — generation model used by `serve`, default `llama3.2`
 CLI flags always override env vars.
+## Quantization & memory reporting (SA demo flow)
+A short walkthrough that lets a Solutions Architect tell a complete "quality, speed, cost" story end-to-end. It assumes Qdrant + Ollama are running and the venv is active.
+```bash
+# 1. Baseline: full-precision dense vectors.
+python app.py ingest
+python app.py memory
+# 2. Apply scalar (int8) quantization in place — ~4x smaller, ~no recall loss.
+python app.py quantize --mode scalar
+python app.py memory   # active quantization should now read 'scalar'
+# 3. Demo recall vs latency on a quantized collection.
+python app.py query --query "hybrid search workflow" --no-rescore
+python app.py query --query "hybrid search workflow" --rescore --oversampling 2.0
+# 4. Or recreate from scratch with a different mode.
+python app.py ingest --quantization binary       # 32x smaller (best on >=1024-dim models)
+python app.py ingest --quantization product      # 16x smaller, lowest recall
+```
+Key points to surface during the demo:
+- `scalar` (int8, quantile=0.99) is a near-free win on most embedding models.
+- `binary` is the largest savings but only safe on ≥1024-dim embeddings; `nomic-embed-text` (768 dim) will lose noticeable recall.
+- `product` (PQ x16) is a middle ground that preserves more structure than binary while still saving 16x.
+- `--always-ram` (default) keeps quantized vectors hot in RAM. With original vectors on disk this gives RAM costs comparable to scalar/binary while preserving the ability to re-score from full precision.
+- `--rescore` reads the original vectors to refine the top-k; `--oversampling N` fetches `N×limit` candidates first so re-scoring has more material to work with.
 ## Extending the demo
 A few directions the code is structured to support:
 - **Payload filtering.** The payload schema already includes `source`, `category`, `tags`, `source_type`, and `created_at`. Add `client.create_payload_index(...)` calls in `ensure_collection` and pass a `models.Filter` to `client.query_points` in `search_documents`.
