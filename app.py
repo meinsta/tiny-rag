@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,9 +21,13 @@ from qdrant_client import QdrantClient, models
 DEFAULT_COLLECTION = "ollama_demo_docs"
 DEFAULT_DATA_FILE = Path(__file__).with_name("sample_data.json")
 DEFAULT_EVAL_FILE = Path(__file__).with_name("qa_eval.json")
+# Canonical artifact written by ``app.py eval`` and auto-loaded by the
+# Streamlit dashboard, so a fresh CLI run is immediately visible in the UI.
+DEFAULT_EVAL_OUTPUT_FILE = Path(__file__).with_name("eval_results.json")
 STATIC_DIR = Path(__file__).with_name("static")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+DEFAULT_QDRANT_API_KEY: Optional[str] = os.getenv("QDRANT_API_KEY") or None
 DEFAULT_EMBED_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
 DEFAULT_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2")
 # Reranker default. Small (~22MB), fast, MS MARCO-trained cross-encoder —
@@ -43,6 +47,13 @@ _POINT_ID_NAMESPACE = uuid.UUID("6f1d2c3a-9b0e-4a8e-9f31-1c2b3d4e5f60")
 SUPPORTED_FILE_SUFFIXES = {".pdf", ".txt", ".md", ".markdown"}
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB per file; demo guardrail.
 
+def make_client(url: str) -> QdrantClient:
+    """Create a QdrantClient, passing an API key when QDRANT_API_KEY is set."""
+    if DEFAULT_QDRANT_API_KEY:
+        return QdrantClient(url=url, api_key=DEFAULT_QDRANT_API_KEY)
+    return QdrantClient(url=url)
+
+
 # Module-level cache for the sparse embedding model (lazy-loaded on first use).
 _sparse_encoder: Optional[Any] = None
 # Module-level cache for cross-encoder rerankers, keyed by model name.
@@ -60,6 +71,16 @@ class ChatRequest(BaseModel):
     # Optional cross-encoder reranking. None means "use server default".
     rerank: Optional[bool] = None
     rerank_model: Optional[str] = None
+
+
+class ForgetRequest(BaseModel):
+    """Body of POST /forget. Either ``source`` (single file) or ``all=True``.
+
+    The dashboard / GUI calls this to drop ingested data without resorting to
+    raw Qdrant clients. Setting both is a client error; setting neither is too.
+    """
+    source: Optional[str] = None
+    all: bool = False
 
 
 def load_documents(data_file: Path) -> List[Dict[str, Any]]:
@@ -172,6 +193,46 @@ def generate_text(prompt: str, model: str, ollama_url: str) -> str:
         return text.strip()
 
     raise RuntimeError("Ollama generation response did not include a non-empty 'response' field.")
+
+
+def generate_text_stream(
+    prompt: str, model: str, ollama_url: str
+) -> Iterable[str]:
+    """Yield response chunks from Ollama's ``/api/generate`` as they arrive.
+
+    Ollama returns a JSON-Lines stream with one object per chunk:
+    ``{"response": "<text>", "done": false}`` until a final ``done: true``
+    record. We surface ``response`` strings to the caller and stop on
+    ``done``. Network/parse errors raise ``RuntimeError`` so the SSE
+    handler can emit a structured ``error`` event.
+    """
+    url = f"{ollama_url.rstrip('/')}/api/generate"
+    payload = {"model": model, "prompt": prompt, "stream": True}
+    try:
+        response = requests.post(url, json=payload, timeout=240, stream=True)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            "Unable to start an Ollama generation stream. "
+            "Ensure Ollama is running and the generation model is available. "
+            f"Details: {exc}"
+        ) from exc
+    try:
+        for raw in response.iter_lines(decode_unicode=False):
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                # Malformed line — skip rather than crash the stream.
+                continue
+            chunk = data.get("response")
+            if isinstance(chunk, str) and chunk:
+                yield chunk
+            if data.get("done"):
+                return
+    finally:
+        response.close()
 
 
 def _sparse_available() -> bool:
@@ -913,7 +974,7 @@ def search_documents(
     cross-encoder before truncating to ``limit``. If fastembed isn't
     installed the rerank stage silently no-ops and the suffix is omitted.
     """
-    client = QdrantClient(url=qdrant_url)
+    client = make_client(qdrant_url)
     dense_vector = get_embedding(query, model, ollama_url)
     query_filter = build_filter(
         category=filter_category,
@@ -1053,7 +1114,7 @@ def ingest_documents(args: argparse.Namespace) -> None:
     if not documents:
         raise ValueError("No documents to ingest")
 
-    client = QdrantClient(url=args.qdrant_url)
+    client = make_client(args.qdrant_url)
     if client.collection_exists(args.collection):
         client.delete_collection(args.collection)
 
@@ -1114,7 +1175,7 @@ def ingest_files_command(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"File(s) not found: {', '.join(missing)}")
 
     tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
-    client = QdrantClient(url=args.qdrant_url)
+    client = make_client(args.qdrant_url)
     quantization_config = build_quantization_config(
         getattr(args, "quantization", "none"),
         always_ram=getattr(args, "always_ram", True),
@@ -1219,7 +1280,7 @@ def memory_report(args: argparse.Namespace) -> None:
     storage profiles, the active one called out so the customer sees what
     they're getting today vs. what they could get.
     """
-    client = QdrantClient(url=args.qdrant_url)
+    client = make_client(args.qdrant_url)
     if not client.collection_exists(args.collection):
         raise RuntimeError(
             f"Collection '{args.collection}' does not exist. Ingest first."
@@ -1287,7 +1348,7 @@ def quantize_collection(args: argparse.Namespace) -> None:
     Qdrant re-quantizes existing segments asynchronously; running ``memory``
     a few seconds later is a reliable way to verify the change took effect.
     """
-    client = QdrantClient(url=args.qdrant_url)
+    client = make_client(args.qdrant_url)
     if not client.collection_exists(args.collection):
         raise RuntimeError(
             f"Collection '{args.collection}' does not exist. Ingest first."
@@ -1656,39 +1717,34 @@ def _run_eval_config(
         "mode": last_mode,
         "runs": len(latencies),
         "mean": (sum(latencies) / len(latencies)) if latencies else 0.0,
+        "p50": _percentile(latencies, 50),
+        "p95": _percentile(latencies, 95),
         "hits": hits,
         "total": scored_queries,
         "mrr": (rr_sum / scored_queries) if scored_queries else 0.0,
     }
 
 
-def eval_command(args: argparse.Namespace) -> None:
-    """Evaluate retrieval quality on a labeled query set.
+def run_eval_sweep(
+    args: argparse.Namespace,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Programmatic entry point for the eval harness.
 
-    Sweeps a small grid of retrieval configurations against the same query
-    file used by ``bench`` and reports recall@k, mean reciprocal rank (MRR),
-    and mean end-to-end latency per config. Where ``bench`` focuses on
-    latency percentiles, ``eval`` focuses on quality metrics so SAs can
-    answer "does reranking actually help?" with a single command.
+    Returns ``(rows, meta)``. ``rows`` mirrors what ``eval_command`` prints in
+    its table (one entry per (config, quantization) pair) and ``meta`` carries
+    sweep-level info (initial / final quantization, query count, etc.) so
+    callers like the Streamlit dashboard don't need to recompute it.
 
-    Configs evaluated:
-      - baseline (the auto-selected dense / hybrid mode for the collection)
-      - baseline+rescore (only when ``--include-rescore``; rescore=True,
-        oversampling=2.0; only meaningful on quantized collections)
-      - rerank (skipped when ``--no-rerank``)
-      - rerank+rescore (when both flags are active)
-
-    When ``--quantize-modes`` is supplied, the entire config grid is run
-    once per requested quantization mode. Each mode is applied in-place
-    via ``client.update_collection`` before its sweep, so SAs can compare
-    recall/MRR across {scalar, binary, product} without re-ingesting.
+    This is the exact same logic ``eval_command`` runs — it's split out so
+    non-CLI consumers (notebooks, dashboards, automated runs) can drive the
+    harness without going through ``argparse.parse_args`` / stdout.
     """
     queries = _load_eval_queries(Path(args.queries_file))
     if not queries:
         raise ValueError("Eval file contains no queries.")
 
-    include_rerank = not args.no_rerank
-    include_rescore = bool(args.include_rescore)
+    include_rerank = not getattr(args, "no_rerank", False)
+    include_rescore = bool(getattr(args, "include_rescore", False))
 
     configs: List[Dict[str, Any]] = [
         {
@@ -1726,27 +1782,30 @@ def eval_command(args: argparse.Namespace) -> None:
                 }
             )
 
-    # Parse and validate the quantization sweep list. Empty/None means
-    # "don't touch the collection—run once with whatever's currently active".
     quantize_modes_arg = getattr(args, "quantize_modes", None)
     sweep_modes: List[Optional[str]]
     if quantize_modes_arg:
         parsed = [m.strip() for m in quantize_modes_arg.split(",") if m.strip()]
-        bad = [m for m in parsed if m not in ("scalar", "binary", "product")]
+        valid = ("none", "scalar", "binary", "product")
+        bad = [m for m in parsed if m not in valid]
         if bad:
             raise ValueError(
                 f"Unsupported --quantize-modes value(s): {bad}. "
-                "Choose from scalar, binary, product (in-place updates only)."
+                f"Choose from {', '.join(valid)}. "
+                "'none' is a measurement-only baseline (no in-place update)."
             )
         sweep_modes = list(parsed)
     else:
         sweep_modes = [None]
 
-    # Resolve the starting quantization mode so we can report on it later.
     sweep_client: Optional[QdrantClient] = None
     initial_mode: Optional[str] = None
+    # Connect once if we'll need to mutate or repeatedly inspect the collection.
+    needs_client = quantize_modes_arg and any(
+        m not in (None, "none") for m in sweep_modes
+    )
     if quantize_modes_arg:
-        sweep_client = QdrantClient(url=args.qdrant_url)
+        sweep_client = make_client(args.qdrant_url)
         if not sweep_client.collection_exists(args.collection):
             raise RuntimeError(
                 f"Collection '{args.collection}' does not exist. Ingest first."
@@ -1759,8 +1818,31 @@ def eval_command(args: argparse.Namespace) -> None:
             initial_mode = None
 
     rows: List[Dict[str, Any]] = []
+    final_mode: Optional[str] = None
     for q_mode in sweep_modes:
-        if q_mode is not None and sweep_client is not None:
+        # 'none' as a sweep entry means "measurement-only baseline": don't
+        # touch the collection, just label the row with whatever mode is
+        # currently active. So a collection that's actually in 'none' yields
+        # a true full-precision baseline; one that's already quantized
+        # yields a row tagged with the detected mode (which is honest —
+        # there's no in-place way to switch back to 'none').
+        if q_mode is None or q_mode == "none":
+            try:
+                effective_quant = detect_quantization_mode(
+                    (sweep_client or make_client(args.qdrant_url))
+                    .get_collection(args.collection)
+                )
+            except Exception:
+                effective_quant = "?" if q_mode is None else "none"
+            if q_mode == "none" and effective_quant != "none":
+                print(
+                    f"  note: --quantize-modes requested 'none' but collection "
+                    f"is currently in '{effective_quant}'. Tagging row with "
+                    "the actual mode; re-ingest without --quantization to "
+                    "get a true full-precision baseline."
+                )
+        else:
+            assert sweep_client is not None  # quantize_modes_arg implies client
             print(
                 f"Applying quantization='{q_mode}' to '{args.collection}' "
                 "in-place (always_ram=True)..."
@@ -1773,23 +1855,57 @@ def eval_command(args: argparse.Namespace) -> None:
             )
             _wait_for_collection_green(sweep_client, args.collection)
             effective_quant = q_mode
-        else:
-            try:
-                effective_quant = detect_quantization_mode(
-                    QdrantClient(url=args.qdrant_url).get_collection(
-                        args.collection
-                    )
-                )
-            except Exception:
-                effective_quant = "?"
+        final_mode = effective_quant
 
         for cfg in configs:
             row = _run_eval_config(args, queries, cfg)
             row["quantization"] = effective_quant
             rows.append(row)
 
+    meta: Dict[str, Any] = {
+        "collection": args.collection,
+        "queries_count": len(queries),
+        "limit": args.limit,
+        "repeats": args.repeats,
+        "hnsw_ef": args.hnsw_ef,
+        "rerank_model": getattr(args, "rerank_model", None) or DEFAULT_RERANK_MODEL,
+        "include_rescore": include_rescore,
+        "include_rerank": include_rerank,
+        "sweep_modes": [m for m in sweep_modes if m is not None],
+        "initial_quantization": initial_mode,
+        "final_quantization": final_mode,
+    }
+    return rows, meta
+
+
+def eval_command(args: argparse.Namespace) -> None:
+    """Evaluate retrieval quality on a labeled query set.
+
+    Sweeps a small grid of retrieval configurations against the same query
+    file used by ``bench`` and reports recall@k, mean reciprocal rank (MRR),
+    and mean end-to-end latency per config. Where ``bench`` focuses on
+    latency percentiles, ``eval`` focuses on quality metrics so SAs can
+    answer "does reranking actually help?" with a single command.
+
+    Configs evaluated:
+      - baseline (the auto-selected dense / hybrid mode for the collection)
+      - baseline+rescore (only when ``--include-rescore``; rescore=True,
+        oversampling=2.0; only meaningful on quantized collections)
+      - rerank (skipped when ``--no-rerank``)
+      - rerank+rescore (when both flags are active)
+
+    When ``--quantize-modes`` is supplied, the entire config grid is run
+    once per requested quantization mode. Each mode is applied in-place
+    via ``client.update_collection`` before its sweep, so SAs can compare
+    recall/MRR across {scalar, binary, product} without re-ingesting.
+
+    Pass ``--output-json PATH`` to dump ``{meta, rows}`` for the Streamlit
+    dashboard or further analysis.
+    """
+    rows, meta = run_eval_sweep(args)
+
     print(
-        f"Eval: {len(queries)} queries x {args.repeats} repeats "
+        f"Eval: {meta['queries_count']} queries x {args.repeats} repeats "
         f"on '{args.collection}' (limit={args.limit}, hnsw_ef={args.hnsw_ef})."
     )
     print()
@@ -1814,10 +1930,12 @@ def eval_command(args: argparse.Namespace) -> None:
             f"{recall_str:>14s} {mrr_str:>7s}"
         )
     print()
-    if quantize_modes_arg and initial_mode and initial_mode != sweep_modes[-1]:
+    initial_mode = meta.get("initial_quantization")
+    final_mode = meta.get("final_quantization")
+    if meta["sweep_modes"] and initial_mode and initial_mode != final_mode:
         print(
             f"Note: collection started in quantization='{initial_mode}' but is "
-            f"now in '{sweep_modes[-1]}'. Run 'python app.py quantize "
+            f"now in '{final_mode}'. Run 'python app.py quantize "
             f"--mode {initial_mode}' (or re-ingest without --quantization to "
             "reset to none) to restore the previous state."
         )
@@ -1827,9 +1945,19 @@ def eval_command(args: argparse.Namespace) -> None:
         "finer-grained matching against PDF chunks."
     )
 
+    output_json = getattr(args, "output_json", None)
+    if output_json:
+        out_path = Path(output_json).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps({"meta": meta, "rows": rows}, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Wrote {len(rows)} rows + meta to {out_path}")
+
 
 def traverse_documents(args: argparse.Namespace) -> None:
-    client = QdrantClient(url=args.qdrant_url)
+    client = make_client(args.qdrant_url)
     offset = None
     shown = 0
 
@@ -1958,6 +2086,231 @@ def create_rag_app(
             ],
         }
 
+    @app.post("/chat/stream")
+    def chat_stream(request: ChatRequest) -> StreamingResponse:
+        """SSE variant of ``/chat`` with per-stage latency timings.
+
+        Emits three event types in order:
+          - ``meta`` once: ``{search_mode, timings: {embed_ms, search_ms,
+            rerank_ms, rerank_active}, citations, collection, chat_model}``.
+            Clients can render citations and a waterfall skeleton before
+            generation starts.
+          - ``token`` zero or more times: ``{t: '<chunk>'}`` where each
+            chunk is whatever Ollama's stream produced (often a few
+            characters or a single token; not strictly word-aligned).
+          - ``done`` once at the end: ``{timings}`` with ``generate_ms``
+            and ``total_ms`` filled in.
+
+        On any failure mid-stream the handler emits ``error`` with a
+        ``detail`` string and stops; the client should treat that as
+        the terminating event.
+        """
+        effective_limit = (
+            request.limit if request.limit is not None else default_limit
+        )
+        effective_rerank = (
+            request.rerank if request.rerank is not None else default_rerank
+        )
+        effective_rerank_model = (
+            request.rerank_model or default_rerank_model
+        )
+
+        def _sse(event: str, data: Dict[str, Any]) -> str:
+            """Format a single SSE event block. Always trailing newline pair."""
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        def event_stream() -> Iterable[str]:
+            timings: Dict[str, Any] = {}
+            t_overall = time.perf_counter()
+            try:
+                client = make_client(qdrant_url)
+
+                # ----- Stage 1: embed (dense + sparse) -----
+                t0 = time.perf_counter()
+                dense_vector = get_embedding(
+                    request.message, embed_model, ollama_url
+                )
+                sparse_vec = get_sparse_embedding(request.message)
+                timings["embed_ms"] = (time.perf_counter() - t0) * 1000.0
+
+                # ----- Stage 2: vector search (Qdrant) -----
+                query_filter = build_filter(
+                    category=request.filter_category,
+                    source=request.filter_source,
+                    source_type=request.filter_source_type,
+                    tags=request.filter_tags,
+                )
+                rerank_active = bool(effective_rerank) and _reranker_available()
+                candidate_limit = (
+                    max(effective_limit * 5, 25) if rerank_active else effective_limit
+                )
+
+                # Inspect the collection to choose hybrid vs dense (mirrors
+                # search_documents but inlined so we can time the stages).
+                has_sparse = False
+                is_legacy = False
+                try:
+                    info = client.get_collection(collection)
+                    vectors_cfg = info.config.params.vectors
+                    is_legacy = not isinstance(vectors_cfg, dict)
+                    if not is_legacy:
+                        sv = getattr(
+                            info.config.params, "sparse_vectors", None
+                        )
+                        has_sparse = bool(sv and "sparse" in sv)
+                except Exception:
+                    pass
+
+                t0 = time.perf_counter()
+                if is_legacy:
+                    response = client.query_points(
+                        collection_name=collection,
+                        query=dense_vector,
+                        limit=candidate_limit,
+                        with_payload=True,
+                        query_filter=query_filter,
+                    )
+                    points = response.points
+                    base_mode = "dense"
+                elif has_sparse and sparse_vec is not None:
+                    prefetch_limit = max(candidate_limit * 4, 20)
+                    response = client.query_points(
+                        collection_name=collection,
+                        prefetch=[
+                            models.Prefetch(
+                                query=dense_vector,
+                                using="dense",
+                                limit=prefetch_limit,
+                                filter=query_filter,
+                            ),
+                            models.Prefetch(
+                                query=sparse_vec,
+                                using="sparse",
+                                limit=prefetch_limit,
+                                filter=query_filter,
+                            ),
+                        ],
+                        query=models.FusionQuery(fusion=models.Fusion.RRF),
+                        limit=candidate_limit,
+                        with_payload=True,
+                    )
+                    points = response.points
+                    base_mode = "hybrid"
+                else:
+                    response = client.query_points(
+                        collection_name=collection,
+                        query=dense_vector,
+                        using="dense",
+                        limit=candidate_limit,
+                        with_payload=True,
+                        query_filter=query_filter,
+                    )
+                    points = response.points
+                    base_mode = "dense"
+                timings["search_ms"] = (time.perf_counter() - t0) * 1000.0
+
+                # ----- Stage 3: rerank (optional) -----
+                if rerank_active and points:
+                    t0 = time.perf_counter()
+                    points = rerank_points(
+                        request.message,
+                        points,
+                        top_k=effective_limit,
+                        model_name=effective_rerank_model,
+                    )
+                    timings["rerank_ms"] = (
+                        time.perf_counter() - t0
+                    ) * 1000.0
+                    search_mode = f"{base_mode}+rerank"
+                else:
+                    points = list(points)[:effective_limit]
+                    timings["rerank_ms"] = 0.0
+                    search_mode = base_mode
+                timings["rerank_active"] = bool(
+                    rerank_active and timings["rerank_ms"] > 0
+                )
+
+                # Build citations + contexts (same shape as /chat).
+                contexts: List[Dict[str, Any]] = []
+                for result in points:
+                    payload = result.payload or {}
+                    contexts.append(
+                        {
+                            "id": result.id,
+                            "score": float(result.score),
+                            "title": str(payload.get("title", "(untitled)")),
+                            "category": str(
+                                payload.get("category", "unknown")
+                            ),
+                            "text": str(payload.get("text", "")),
+                            "source": payload.get("source"),
+                            "source_type": payload.get("source_type"),
+                            "chunk_index": payload.get("chunk_index"),
+                            "chunk_count": payload.get("chunk_count"),
+                            "page_start": payload.get("page_start"),
+                            "page_end": payload.get("page_end"),
+                        }
+                    )
+                citations = [
+                    {
+                        "id": item["id"],
+                        "score": item["score"],
+                        "title": item["title"],
+                        "category": item["category"],
+                        "source": item["source"],
+                        "source_type": item["source_type"],
+                        "chunk_index": item["chunk_index"],
+                        "chunk_count": item["chunk_count"],
+                        "page_start": item["page_start"],
+                        "page_end": item["page_end"],
+                        "text_preview": format_preview(
+                            item["text"], max_length=180
+                        ),
+                    }
+                    for item in contexts
+                ]
+
+                yield _sse(
+                    "meta",
+                    {
+                        "search_mode": search_mode,
+                        "timings": dict(timings),
+                        "citations": citations,
+                        "collection": collection,
+                        "chat_model": chat_model,
+                    },
+                )
+
+                # ----- Stage 4: generate (streamed) -----
+                prompt = build_rag_prompt(request.message, contexts)
+                t0 = time.perf_counter()
+                for chunk in generate_text_stream(
+                    prompt, chat_model, ollama_url
+                ):
+                    yield _sse("token", {"t": chunk})
+                timings["generate_ms"] = (
+                    time.perf_counter() - t0
+                ) * 1000.0
+                timings["total_ms"] = (
+                    time.perf_counter() - t_overall
+                ) * 1000.0
+                yield _sse("done", {"timings": timings})
+            except Exception as exc:
+                # Best-effort: tell the client *why* the stream stopped, so
+                # the UI can render an error rather than a stuck spinner.
+                yield _sse("error", {"detail": str(exc)})
+
+        # text/event-stream is the canonical SSE media type. We also disable
+        # buffering hints so reverse proxies don't accumulate the body.
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.post("/ingest")
     async def ingest_endpoint(
         files: List[UploadFile] = File(..., description="PDF, MD, or TXT files"),
@@ -1976,7 +2329,7 @@ def create_rag_app(
             )
 
         parsed_tags = [t.strip() for t in (tags or "").split(",") if t.strip()]
-        client = QdrantClient(url=qdrant_url)
+        client = make_client(qdrant_url)
         results: List[Dict[str, Any]] = []
         total = 0
         for upload in files:
@@ -2039,6 +2392,130 @@ def create_rag_app(
             "embed_model": embed_model,
             "total_chunks": total,
             "results": results,
+        }
+
+    @app.get("/sources")
+    def list_sources() -> Dict[str, Any]:
+        """Return one row per distinct ingested source with chunk + page counts.
+
+        Drives the GUI's 'Ingested sources' card so users can see what's in
+        the index and decide what to forget.
+        """
+        client = make_client(qdrant_url)
+        if not client.collection_exists(collection):
+            return {"collection": collection, "sources": [], "total_points": 0}
+
+        # Aggregate by source via scroll. The demo collection is small
+        # (sample data + a handful of uploaded PDFs), so a full scroll is
+        # cheap. For larger collections this would benefit from a server-side
+        # facet/group-by, but Qdrant doesn't expose that natively.
+        by_source: Dict[str, Dict[str, Any]] = {}
+        offset: Optional[Any] = None
+        while True:
+            points, offset = client.scroll(
+                collection_name=collection,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                payload = p.payload or {}
+                src = payload.get("source")
+                if not src:
+                    continue
+                row = by_source.setdefault(
+                    src,
+                    {
+                        "source": src,
+                        "title": payload.get("title"),
+                        "source_type": payload.get("source_type"),
+                        "category": payload.get("category"),
+                        "chunks": 0,
+                        "pages": payload.get("page_count"),
+                    },
+                )
+                row["chunks"] += 1
+            if offset is None or not points:
+                break
+
+        rows = sorted(
+            by_source.values(), key=lambda r: (-r["chunks"], r["source"])
+        )
+        total = sum(r["chunks"] for r in rows)
+        return {
+            "collection": collection,
+            "total_points": total,
+            "sources": rows,
+        }
+
+    @app.post("/forget")
+    def forget(request: ForgetRequest) -> Dict[str, Any]:
+        """Delete ingested data. Either one source by name, or all of it.
+
+        - ``{"source": "file.pdf"}`` removes every chunk where ``payload.source``
+          equals that string (mirrors the deterministic-id idempotence used by
+          ``ingest_chunks`` itself).
+        - ``{"all": true}`` drops the collection entirely; the next ingest call
+          recreates it with whatever embedding / sparse / quantization config
+          is active at that moment.
+        """
+        if request.all and request.source:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide either 'source' or 'all=true', not both.",
+            )
+        if not request.all and not request.source:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide 'source' (filename) or 'all=true' to forget data.",
+            )
+
+        client = make_client(qdrant_url)
+        if not client.collection_exists(collection):
+            return {
+                "collection": collection,
+                "deleted": 0,
+                "action": "noop",
+                "detail": "Collection does not exist; nothing to forget.",
+            }
+
+        if request.all:
+            try:
+                deleted = client.count(collection, exact=True).count
+            except Exception:
+                deleted = None
+            client.delete_collection(collection)
+            return {
+                "collection": collection,
+                "deleted": deleted,
+                "action": "drop_collection",
+                "detail": (
+                    "Collection dropped. Next ingest will lazily recreate it."
+                ),
+            }
+
+        # Single-source delete — count first so the response can report it.
+        flt = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="source",
+                    match=models.MatchValue(value=request.source),
+                )
+            ]
+        )
+        try:
+            deleted = client.count(
+                collection, exact=True, count_filter=flt
+            ).count
+        except Exception:
+            deleted = None
+        _delete_chunks_by_source(client, collection, request.source)
+        return {
+            "collection": collection,
+            "deleted": deleted,
+            "action": "delete_by_source",
+            "source": request.source,
         }
 
     return app
@@ -2573,12 +3050,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Comma-separated quantization modes to sweep (e.g. "
-            "'scalar,binary,product'). Each mode is applied in-place via "
-            "update_collection before its config sweep, so the same eval "
-            "runs across multiple compression profiles in one shot. Choices: "
-            "scalar, binary, product. The collection is left in the LAST "
-            "requested mode — the harness prints a 'note' line telling you "
-            "how to restore the original mode if it changed."
+            "'none,scalar,binary,product'). Each non-'none' mode is applied "
+            "in-place via update_collection before its config sweep, so the "
+            "same eval runs across multiple compression profiles in one shot. "
+            "'none' is a measurement-only baseline (the collection is not "
+            "modified; the row is tagged with the currently active mode), "
+            "useful for capturing a full-precision row when the collection "
+            "already starts in 'none'. The collection is left in the LAST "
+            "non-'none' requested mode — the harness prints a 'note' line "
+            "telling you how to restore the original mode if it changed."
+        ),
+    )
+    eval_parser.add_argument(
+        "--output-json",
+        dest="output_json",
+        default=str(DEFAULT_EVAL_OUTPUT_FILE),
+        help=(
+            "Path to dump '{meta, rows}' as JSON (default: %(default)s). "
+            "The Streamlit dashboard auto-loads this exact path on startup, "
+            "so a CLI eval run is immediately reflected in the UI. Pass "
+            "--output-json '' to disable the dump."
         ),
     )
     eval_parser.set_defaults(func=eval_command)

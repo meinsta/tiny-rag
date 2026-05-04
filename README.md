@@ -29,10 +29,11 @@ This README doubles as a developer tutorial: it walks through the ingestion pipe
 The ingest pipeline is shared by three entrypoints — the `ingest` CLI (sample JSON), the `ingest-file` CLI (local PDF/MD/TXT), and the `POST /ingest` endpoint — all of which funnel into `ingest_chunks` in `app.py`. The /chat endpoint and `query` CLI share `search_documents`, which automatically picks hybrid or dense-only retrieval based on what the collection and runtime support.
 ## Project layout
 - `app.py` — single-file CLI + FastAPI app. Subcommands: `ingest`, `ingest-file`, `query`, `traverse`, `serve`, `memory`, `quantize`, `bench`, `eval`.
+- `dashboard.py` — Streamlit dashboard that drives `app.run_eval_sweep` from a browser and visualizes the resulting recall / MRR / latency / quantization memory metrics.
 - `static/index.html` — single-file HTML/CSS/JS GUI served by `serve` (upload card + chat box + citations).
 - `sample_data.json` — 8 example documents used by `ingest` (a JSON list of `{id, title, text, category}`).
 - `qa_eval.json` — 8 labeled queries (`{query, expected_source}`) consumed by `bench` (recall@k + latency) and `eval` (recall@k + MRR).
-- `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`, plus optional `fastembed` (enables hybrid BM42 search).
+- `requirements.txt` — Python deps: `qdrant-client`, `requests`, `fastapi`, `uvicorn`, `pydantic`, `pypdf`, `python-multipart`, plus optional `fastembed` (hybrid BM42 search) and `streamlit` + `pandas` (eval dashboard).
 Key symbols inside `app.py`, if you want to read along:
 - `extract_pdf_pages`, `extract_chunks_from_bytes` — file → tokens with optional page numbers.
 - `chunk_words` — word-window chunker with overlap.
@@ -302,7 +303,7 @@ python app.py eval [--collection NAME] [--queries-file qa_eval.json] \
 ```
 Where `bench` focuses on latency percentiles, `eval` focuses on retrieval *quality*. It sweeps a small grid of configs against the same query set and reports recall@k, mean reciprocal rank (MRR), and mean end-to-end latency per config.
 Configs evaluated by default: `baseline` (the auto-selected dense / hybrid mode) and `rerank` (cross-encoder on top). `--no-rerank` skips the rerank config; `--include-rescore` adds `baseline+rescore` and (when reranking) `rerank+rescore` variants that pass `rescore=True` + `oversampling=2.0` through to Qdrant — only meaningful on quantized collections.
-`--quantize-modes` accepts a comma-separated list from `{scalar, binary, product}` and runs the entire config grid once per requested mode. Each mode is applied in-place via `client.update_collection` before its sweep, so you get one apples-to-apples table comparing retrieval quality across compression profiles — no re-ingest required. The output table gains a `quant` column. The collection is left in the **last** requested mode; the harness prints a `Note: ...` line at the end with the exact `python app.py quantize --mode <orig>` command needed to restore the previous state. (Note: in-place updates can't switch a collection to `none`; reset by re-ingesting without `--quantization` if needed.)
+`--quantize-modes` accepts a comma-separated list from `{none, scalar, binary, product}` and runs the entire config grid once per requested mode. Each non-`none` mode is applied in-place via `client.update_collection` before its sweep, so you get one apples-to-apples table comparing retrieval quality across compression profiles — no re-ingest required. `none` is a *measurement-only* entry: it doesn't modify the collection, just adds a row tagged with whatever mode is currently active. Combine `none,scalar,binary,product` against a collection that starts in `none` to capture a true full-precision baseline alongside the quantized passes (the dashboard's **Precision tradeoff** tab uses that baseline to compute Δ columns). The output table gains a `quant` column. The collection is left in the **last** non-`none` requested mode; the harness prints a `Note: ...` line at the end with the exact `python app.py quantize --mode <orig>` command needed to restore the previous state. (Note: in-place updates can't switch a collection to `none`; reset by re-ingesting without `--quantization` if needed.)
 **MRR (mean reciprocal rank)** is the average of `1/rank` for the first matching chunk in the top-k across all scored queries; misses contribute 0. Recall@k tells you whether the right chunk is *somewhere* in the top-k; MRR additionally rewards configs that rank it higher. Reranking typically lifts both, but MRR is what moves most when the right chunk was already in top-k but buried at position 3.
 Eval entries support a richer schema than bench:
 ```json
@@ -340,6 +341,24 @@ Note: collection started in quantization='none' but is now in 'product'. Run
 'python app.py quantize --mode none' (or re-ingest without --quantization to
 reset to none) to restore the previous state.
 ```
+## Eval dashboard (Streamlit)
+For an interactive view of the same data, the repo ships a Streamlit dashboard at `dashboard.py`. It calls `app.run_eval_sweep` directly so the metrics match the CLI table exactly — no separate code path or schema.
+```bash
+# One-time:
+pip install -r requirements.txt    # pulls streamlit + pandas
+# Run:
+streamlit run dashboard.py
+# Opens http://localhost:8501 by default.
+```
+The sidebar exposes every knob `app.py eval` accepts (collection, queries file, top-k, repeats, HNSW ef, rerank model, `--no-rerank`, `--include-rescore`, and the multi-select **Modes to sweep**). Click **Run eval** to execute the sweep against the live Qdrant + Ollama; the dashboard updates with:
+- Top-line metric cards: best recall@k, best MRR, fastest config (mean latency), distinct quantization modes evaluated.
+- **Quality** tab — grouped bar charts for recall@k and MRR per (config, quant).
+- **Latency** tab — grouped bar chart selectable across `mean` / `p50` / `p95`.
+- **Recall vs Latency** tab — scatter plot (top-left = ideal); each point is a (config, quant) combination.
+- **Precision tradeoff** tab — single-pane comparison across quantization modes: compression ratio + RAM, average recall@k, MRR, and mean latency, plus Δ-vs-`none` columns when the baseline is in scope. Best read after running the sweep with `none` selected alongside `scalar / binary / product`.
+- **Memory** tab — lower-bound dense-vector RAM estimate by mode for the live collection (matches the `app.py memory` table).
+- **Raw data** tab — sortable DataFrame plus a **Download as JSON** button so you can share the run.
+If you'd rather run the sweep from the CLI and view it later, dump it with `python app.py eval --output-json results.json --quantize-modes scalar,binary,product`, then paste the path into the dashboard's **Or load a saved JSON** field. Loaded JSON is the same `{meta, rows}` shape produced by `run_eval_sweep`, so notebooks and scripts can consume it directly too.
 ## HTTP API reference
 ### `GET /` — browser GUI
 Serves `static/index.html`: an upload card (files, category, tags, chunk size/overlap, replace toggle) and a chat box that renders citations inline. ⌘/Ctrl+Enter sends from the textarea.
@@ -414,11 +433,64 @@ Per-file errors (unsupported extension, oversize file, malformed PDF, no extract
 FastAPI's auto-generated Swagger UI for `/chat` and `/ingest`.
 ## Configuration via environment variables
 - `QDRANT_URL` — default `http://localhost:6333`
+- `QDRANT_API_KEY` — API key for authenticated Qdrant instances (e.g. Qdrant Cloud). Unset by default (no auth).
 - `OLLAMA_URL` — default `http://localhost:11434`
 - `OLLAMA_MODEL` — embedding model, default `nomic-embed-text`
 - `OLLAMA_CHAT_MODEL` — generation model used by `serve`, default `llama3.2`
 - `RERANK_MODEL` — fastembed cross-encoder used when `--rerank` (CLI) or `rerank=true` (HTTP) is set; default `Xenova/ms-marco-MiniLM-L-6-v2`.
 CLI flags always override env vars.
+## Deploying with Qdrant Cloud
+The app works against [Qdrant Cloud](https://cloud.qdrant.io) (or any authenticated Qdrant instance) with two environment variables. No code changes are needed.
+### 1. Create a `.env` file
+Copy the template below and fill in your cluster details:
+```bash
+# .env  —  never commit this file (it is already in .gitignore)
+QDRANT_URL=https://<cluster-id>.<region>.cloud.qdrant.io:6333
+QDRANT_API_KEY=<your-api-key>
+```
+Find both values in the [Qdrant Cloud dashboard](https://cloud.qdrant.io) under your cluster's **Connection details** and **API keys** sections.
+### 2. Migrate an existing local collection (optional)
+If you already have data in a local Qdrant instance, use the [`qdrant/migration`](https://github.com/qdrant/migration) tool to copy it to the cloud. A ready-to-use wrapper script with validation, logging, and a `--dry-run` mode is available at [`examples/qdrant-to-qdrant/`](https://github.com/qdrant/migration/tree/main/examples/qdrant-to-qdrant) in that repo.
+```bash
+# First expose the gRPC port (6334) on your local Qdrant container if not already open:
+docker stop qdrant && docker run -d --name qdrant \
+  -p 6333:6333 -p 6334:6334 \
+  -v /path/to/qdrant-storage:/qdrant/storage \
+  qdrant/qdrant
+
+# Dry run — validates config and checks connectivity, no data moved:
+SOURCE_URL="http://host.docker.internal:6334" \
+SOURCE_COLLECTION="ollama_demo_docs" \
+TARGET_URL="https://<cluster-id>.<region>.cloud.qdrant.io:6334" \
+TARGET_API_KEY="<your-api-key>" \
+TARGET_COLLECTION="ollama_demo_docs" \
+./examples/qdrant-to-qdrant/migrate.sh --dry-run
+
+# Run the real migration:
+# (same command without --dry-run)
+```
+> **macOS note:** Docker Desktop cannot reach `localhost` from inside a container via `--net=host`. Use `host.docker.internal` in place of `localhost` in `SOURCE_URL`.
+### 3. Start the app
+Source the `.env` file before launching:
+```bash
+set -a && source .env && set +a
+./.venv/bin/python app.py serve --host 127.0.0.1 --port 8000
+```
+Or export inline for a one-off run:
+```bash
+QDRANT_URL="https://..." QDRANT_API_KEY="..." ./.venv/bin/python app.py serve
+```
+### 4. Verify
+```bash
+# Health check:
+curl http://localhost:8000/health
+# Confirm the cloud collection is visible:
+curl http://localhost:8000/sources | python3 -m json.tool
+```
+### Troubleshooting cloud connections
+- **`Unauthenticated` / `401`** — `QDRANT_API_KEY` is not set or is incorrect. Check the value in the Qdrant Cloud dashboard.
+- **`connection refused` on port 6334** — gRPC port is not exposed by your local Docker container. Recreate it with `-p 6334:6334` (see step 2 above).
+- **Migration fails with `ResourceExhausted`** — reduce `BATCH_SIZE` (e.g. `export BATCH_SIZE=16`) or add `--source.max-message-size` to the `docker run` call in `migrate.sh`.
 ## HNSW tuning playground
 Qdrant's vector index is HNSW. Three knobs matter for the recall vs latency demo, and they all flow through this CLI:
 - `--hnsw-m` (on `ingest` / `ingest-file`) — graph degree at build time. Qdrant default is 16. Higher = better recall and more RAM, slower index build. Applied only when the collection is being created; ignored on existing collections (drop and recreate to change).
